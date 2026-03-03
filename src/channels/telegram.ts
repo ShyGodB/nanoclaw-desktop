@@ -39,6 +39,13 @@ export interface TelegramChannelOpts {
   onMigrateGroup?: (oldJid: string, newJid: string) => void;
 }
 
+/** Buffered message waiting to be dispatched (for media group batching). */
+interface PendingMessage {
+  chatJid: string;
+  timestamp: string;
+  msg: import('../types.js').NewMessage;
+}
+
 export class TelegramChannel implements Channel {
   name = 'telegram';
   prefixAssistantName = false;
@@ -47,9 +54,46 @@ export class TelegramChannel implements Channel {
   private opts: TelegramChannelOpts;
   private botToken: string;
 
+  /** Buffer for media group messages: media_group_id → pending messages + debounce timer. */
+  private mediaGroupBuffer = new Map<string, { items: PendingMessage[]; timer: NodeJS.Timeout }>();
+  private static MEDIA_GROUP_DEBOUNCE_MS = 1500;
+
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
+  }
+
+  /**
+   * Buffer a message that belongs to a media group. After no new messages arrive
+   * for MEDIA_GROUP_DEBOUNCE_MS, flush all buffered messages at once so they're
+   * all visible to the next poll cycle.
+   */
+  private bufferMediaGroupMessage(mediaGroupId: string, pending: PendingMessage): void {
+    const existing = this.mediaGroupBuffer.get(mediaGroupId);
+    if (existing) {
+      existing.items.push(pending);
+      clearTimeout(existing.timer);
+      existing.timer = setTimeout(() => this.flushMediaGroup(mediaGroupId), TelegramChannel.MEDIA_GROUP_DEBOUNCE_MS);
+    } else {
+      const timer = setTimeout(() => this.flushMediaGroup(mediaGroupId), TelegramChannel.MEDIA_GROUP_DEBOUNCE_MS);
+      this.mediaGroupBuffer.set(mediaGroupId, { items: [pending], timer });
+    }
+  }
+
+  private flushMediaGroup(mediaGroupId: string): void {
+    const group = this.mediaGroupBuffer.get(mediaGroupId);
+    if (!group) return;
+    this.mediaGroupBuffer.delete(mediaGroupId);
+
+    logger.info({ mediaGroupId, count: group.items.length }, 'Flushing media group');
+    for (const pending of group.items) {
+      this.opts.onChatMetadata(pending.chatJid, pending.timestamp);
+      const base = stripTopicSuffix(pending.chatJid);
+      if (base !== pending.chatJid) {
+        this.opts.onChatMetadata(base, pending.timestamp);
+      }
+      this.opts.onMessage(pending.chatJid, pending.msg);
+    }
   }
 
   async connect(): Promise<void> {
@@ -174,12 +218,7 @@ export class TelegramChannel implements Channel {
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
 
-      this.opts.onChatMetadata(chatJid, timestamp);
-      const base = stripTopicSuffix(chatJid);
-      if (base !== chatJid) {
-        this.opts.onChatMetadata(base, timestamp);
-      }
-      this.opts.onMessage(chatJid, {
+      const msg: import('../types.js').NewMessage = {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
         sender: ctx.from?.id?.toString() || '',
@@ -187,7 +226,19 @@ export class TelegramChannel implements Channel {
         content: `${placeholder}${caption}`,
         timestamp,
         is_from_me: false,
-      });
+      };
+
+      const mediaGroupId = ctx.message?.media_group_id as string | undefined;
+      if (mediaGroupId) {
+        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msg });
+      } else {
+        this.opts.onChatMetadata(chatJid, timestamp);
+        const base = stripTopicSuffix(chatJid);
+        if (base !== chatJid) {
+          this.opts.onChatMetadata(base, timestamp);
+        }
+        this.opts.onMessage(chatJid, msg);
+      }
     };
 
     this.bot.on('message:photo', async (ctx) => {
@@ -242,12 +293,7 @@ export class TelegramChannel implements Channel {
 
       const photoRef = imagePaths ? `[Photo: ${imagePaths[0]}]` : '[Photo]';
 
-      this.opts.onChatMetadata(chatJid, timestamp);
-      const base = stripTopicSuffix(chatJid);
-      if (base !== chatJid) {
-        this.opts.onChatMetadata(base, timestamp);
-      }
-      this.opts.onMessage(chatJid, {
+      const msg: import('../types.js').NewMessage = {
         id: msgId,
         chat_jid: chatJid,
         sender: ctx.from?.id?.toString() || '',
@@ -256,7 +302,19 @@ export class TelegramChannel implements Channel {
         timestamp,
         is_from_me: false,
         imagePaths,
-      });
+      };
+
+      const mediaGroupId = (ctx.message as any).media_group_id as string | undefined;
+      if (mediaGroupId) {
+        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msg });
+      } else {
+        this.opts.onChatMetadata(chatJid, timestamp);
+        const base = stripTopicSuffix(chatJid);
+        if (base !== chatJid) {
+          this.opts.onChatMetadata(base, timestamp);
+        }
+        this.opts.onMessage(chatJid, msg);
+      }
     });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
 
@@ -327,9 +385,82 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:audio', (ctx) =>
       handleAudioMessage(ctx, ctx.message.audio.file_id, 'Audio', '[Audio]'),
     );
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+    this.bot.on('message:document', async (ctx) => {
+      const doc = ctx.message.document;
+      const originalName = doc?.file_name || 'file';
+      const fileId = doc?.file_id;
+
+      const threadId = ctx.message?.is_topic_message ? ctx.message?.message_thread_id : undefined;
+      const chatJid = buildTopicJid(ctx.chat.id, threadId);
+      const groups = this.opts.registeredGroups();
+      const group = groups[chatJid] || groups[stripTopicSuffix(chatJid)];
+      if (!group) {
+        logger.warn({ chatJid }, 'Document from unregistered Telegram chat');
+        return;
+      }
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const msgId = ctx.message.message_id.toString();
+
+      let placeholder = `[Document: ${originalName}]`;
+
+      // Telegram Bot API has a 20MB limit on getFile()
+      if (doc?.file_size && doc.file_size > 20 * 1024 * 1024) {
+        logger.warn({ chatJid, fileName: originalName, fileSize: doc.file_size }, 'Document exceeds 20MB Telegram Bot API limit, skipping download');
+      } else if (fileId) {
+        try {
+          const file = await ctx.api.getFile(fileId);
+          if (file.file_path) {
+            const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+            const resp = await fetch(url);
+            if (resp.ok) {
+              const safeChatJid = chatJid.replace(/[^a-zA-Z0-9-]/g, '_');
+              const fileDir = path.join(DATA_DIR, 'files', safeChatJid);
+              fs.mkdirSync(fileDir, { recursive: true });
+              const safeName = originalName.replace(/[/\\]/g, '_');
+              const localFile = path.join(fileDir, `${msgId}_${safeName}`);
+              const buffer = Buffer.from(await resp.arrayBuffer());
+              fs.writeFileSync(localFile, buffer);
+
+              const relativePath = path.relative(process.cwd(), localFile);
+              placeholder = `[File: ${relativePath}]`;
+              logger.info({ chatJid, localFile, size: buffer.length, fileName: originalName }, 'Telegram document downloaded');
+            } else {
+              logger.warn({ chatJid, status: resp.status, fileName: originalName }, 'Failed to download Telegram document');
+            }
+          }
+        } catch (err) {
+          logger.error({ chatJid, err, fileName: originalName }, 'Error downloading Telegram document');
+        }
+      }
+
+      const msg: import('../types.js').NewMessage = {
+        id: msgId,
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content: `${placeholder}${caption}`,
+        timestamp,
+        is_from_me: false,
+      };
+
+      const mediaGroupId = (ctx.message as any).media_group_id as string | undefined;
+      if (mediaGroupId) {
+        this.bufferMediaGroupMessage(mediaGroupId, { chatJid, timestamp, msg });
+      } else {
+        this.opts.onChatMetadata(chatJid, timestamp);
+        const base = stripTopicSuffix(chatJid);
+        if (base !== chatJid) {
+          this.opts.onChatMetadata(base, timestamp);
+        }
+        this.opts.onMessage(chatJid, msg);
+      }
     });
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
