@@ -25,6 +25,8 @@ Single Node.js process that connects to Telegram, routes messages to Claude Code
 | `src/task-scheduler.ts` | Runs scheduled tasks (runtime-aware) |
 | `src/types.ts` | Topic isolation helpers (`getEffectiveFolder`, `getBaseFolder`) |
 | `src/db.ts` | SQLite operations |
+| `container/tools/patchright-browser.mjs` | Anti-detection browser with proxy support |
+| `container/tools/proxy-manager.mjs` | Per-workspace proxy IP manager (Qingguo API) |
 | `groups/*/CLAUDE.md.default` | Persona templates (tracked in git, "Andy" default) |
 | `groups/*/CLAUDE.md` | Per-project memory (generated from .default, gitignored) |
 
@@ -41,7 +43,17 @@ Single Node.js process that connects to Telegram, routes messages to Claude Code
 
 This repo is forked from `qwibitai/nanoclaw` (upstream). Long-term plan: rebase onto upstream once it stabilizes (tags/releases), then layer our additions on top. Until upstream has a stable version, do NOT merge or sync — develop independently.
 
-Our additions over upstream: Telegram channel (replacing WhatsApp), Lume macOS VM runtime, Patchright anti-detection browser.
+Our additions over upstream: Telegram channel (replacing WhatsApp), Lume macOS VM runtime, Patchright anti-detection browser, per-workspace proxy IP isolation.
+
+## Proxy IP System
+
+Each workspace can have a `.proxy` file at `groups/{topic}/.browser-data/.proxy` to bind a dedicated residential proxy IP (via Qingguo/青果网络 long-term dynamic residential proxy). No `.proxy` = direct connection.
+
+- **Credentials**: `QG_AUTH_KEY` / `QG_AUTH_PWD` in `.env` (see `.env.example`)
+- **IP whitelist**: The machine's public IP must be added to Qingguo's auth whitelist (控制台 → 鉴权白名单)
+- **Management**: `container/tools/proxy-manager.mjs` — assign/renew/list/release proxy IPs
+- **Auto-renewal**: `patchright-browser.mjs` checks `.proxy` deadline at browser launch; renews if expired or within 1 hour of expiry
+- **Architecture details**: See "Proxy IP Architecture" section in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Development
 

@@ -392,4 +392,78 @@ SQLite at `store/messages.db`:
 | `container/agent-runner/src/ipc-mcp-stdio.ts` | MCP tools for agent | `send_message`, `schedule_task`, `send_photo`, etc. |
 | `container/agent-runner/deploy.sh` | SCP agent-runner to VM | Bypasses VirtioFS cache |
 | `container/tools/patchright-browser.mjs` | Anti-detection browser tool | Snapshot/refs, click, fill, screenshot, etc. |
+| `container/tools/proxy-manager.mjs` | Per-workspace proxy IP manager | Assign/renew/list/release via Qingguo API |
 | `container/tools/deploy.sh` | SCP browser tool to VM | Bypasses VirtioFS cache |
+
+## Proxy IP Architecture
+
+Multi-account browser automation requires each workspace to have a distinct residential IP to avoid detection. Proxies are managed per-workspace via Qingguo (青果网络) long-term dynamic residential IPs.
+
+### Per-Workspace Proxy Config
+
+Each workspace can optionally have a `.proxy` file at `groups/{topic}/.browser-data/.proxy`:
+
+```json
+{
+  "server": "socks5://authkey:authpwd@ip:port",
+  "proxyIp": "27.190.61.132",
+  "area": "河北省唐山市",
+  "areaCode": "130200",
+  "isp": "电信",
+  "taskId": "Iat3tBOj4L6U8oGo",
+  "timezone": "Asia/Shanghai",
+  "lang": "zh-CN",
+  "deadline": "2026-03-03 21:38:38"
+}
+```
+
+No `.proxy` file = no proxy = direct connection (default behavior, fully backward compatible).
+
+### IP Lifecycle
+
+```
+ensureBrowser()
+  │
+  ├─ .proxy exists?
+  │    ├─ No  → direct connection, no proxy
+  │    └─ Yes → check deadline
+  │              ├─ > 1h remaining → use current IP
+  │              └─ ≤ 1h remaining or expired → call Qingguo API
+  │                   ├─ extract new IP (same area + ISP)
+  │                   ├─ update .proxy file
+  │                   └─ launch browser with new --proxy-server
+  │
+  ▼
+  Execute task → close browser
+```
+
+Key design points:
+
+- **On-demand renewal**: IP is renewed at browser launch when deadline is within 1 hour, not via a background timer. This ensures the browser never starts with a stale IP.
+- **Task = browser lifetime**: each task starts a fresh browser and closes it when done. No mid-task IP expiration risk (1h buffer).
+- **No release API**: dynamic IPs auto-expire at deadline. `/delete` endpoint is only for static IPs.
+- **Fingerprint alignment**: `.proxy` can override `timezone` and `lang` to match the IP's geography. All mainland China IPs use `Asia/Shanghai` + `zh-CN`.
+- **Isolation stacks with existing model**: workspace already isolates browser profile, cookies, and fingerprint (deterministic from workspace path hash). Proxy adds the IP layer.
+
+### Proxy Manager CLI
+
+`container/tools/proxy-manager.mjs` — manual proxy management:
+
+```bash
+# Assign a new proxy to a workspace
+QG_AUTH_KEY=xxx QG_AUTH_PWD=xxx proxy-manager assign <topic> --area 130200 --isp 电信
+
+# List all proxy assignments
+proxy-manager list
+
+# Renew all expired proxies
+QG_AUTH_KEY=xxx QG_AUTH_PWD=xxx proxy-manager renew
+```
+
+### Qingguo API
+
+- Extract: `GET https://longterm.proxy.qg.net/get?key=AUTH_KEY&num=1&area=CODE&isp=0|1|2|3&format=json&distinct=true`
+- SOCKS5 auth: username=AuthKey, password=AuthPwd
+- ISP codes: 0=any, 1=电信, 2=移动, 3=联通
+- Area codes: 行政区划代码 (e.g. 130200=唐山, 310100=上海)
+- Full API reference: see `memory/qingguo-api.md`

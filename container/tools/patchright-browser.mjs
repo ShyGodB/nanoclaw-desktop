@@ -41,8 +41,80 @@ const PROFILE_DIR = path.join(WORKSPACE_BASE, 'group', '.browser-data');
 const STATE_FILE = path.join(PROFILE_DIR, '.state.json');
 const COOKIES_FILE = path.join(PROFILE_DIR, '.cookies.json');
 const SCREENSHOT_DIR = path.join(WORKSPACE_BASE, 'group');
-const BROWSER_LANG = process.env.BROWSER_LANG || 'zh-TW';
-const BROWSER_TIMEZONE = process.env.BROWSER_TIMEZONE || 'Asia/Taipei';
+const PROXY_FILE = path.join(PROFILE_DIR, '.proxy');
+let BROWSER_LANG = process.env.BROWSER_LANG || 'zh-CN';
+let BROWSER_TIMEZONE = process.env.BROWSER_TIMEZONE || 'Asia/Shanghai';
+let BROWSER_PROXY = process.env.BROWSER_PROXY || '';
+
+const PROXY_RENEW_BUFFER_MS = 60 * 60 * 1000; // 1 hour buffer before deadline
+
+/** Check if proxy is expired or will expire within buffer period */
+function isProxyExpired(proxy) {
+  if (!proxy.deadline) return false;
+  return new Date(proxy.deadline).getTime() - Date.now() < PROXY_RENEW_BUFFER_MS;
+}
+
+/** Call Qingguo API to extract a new IP, update .proxy file */
+async function renewProxy(proxy) {
+  const authKey = process.env.QG_AUTH_KEY;
+  const authPwd = process.env.QG_AUTH_PWD || '';
+  if (!authKey) {
+    console.error('[proxy] QG_AUTH_KEY not set, cannot renew expired proxy');
+    return proxy;
+  }
+
+  const ispMap = { '电信': 1, '移动': 2, '联通': 3 };
+  const ispCode = ispMap[proxy.ispInput] ?? ispMap[proxy.isp] ?? 0;
+  const url = `https://longterm.proxy.qg.net/get?key=${authKey}&num=1&area=${proxy.areaCode || ''}&isp=${ispCode}&format=json&distinct=true`;
+
+  console.error(`[proxy] IP expired (deadline: ${proxy.deadline}), extracting new IP...`);
+  const res = await fetch(url);
+  const json = await res.json();
+
+  if (json.code !== 'SUCCESS' || !json.data?.length) {
+    console.error(`[proxy] Renewal failed: ${json.code} ${json.message || ''}`);
+    return proxy; // fall back to old config
+  }
+
+  const ip = json.data[0];
+  // Auth via IP whitelist — Chromium --proxy-server doesn't support inline credentials
+  const server = `socks5://${ip.server}`;
+
+  const newProxy = {
+    ...proxy,
+    server,
+    proxyIp: ip.proxy_ip,
+    area: ip.area,
+    isp: ip.isp,
+    taskId: ip.task_id,
+    assignedAt: new Date().toISOString(),
+    deadline: ip.deadline,
+  };
+
+  fs.mkdirSync(path.dirname(PROXY_FILE), { recursive: true });
+  fs.writeFileSync(PROXY_FILE, JSON.stringify(newProxy, null, 2));
+  console.error(`[proxy] New IP: ${ip.proxy_ip} (${ip.area}/${ip.isp}) deadline: ${ip.deadline}`);
+  return newProxy;
+}
+
+// Load per-workspace proxy config (overrides env defaults)
+async function loadProxy() {
+  try {
+    if (!fs.existsSync(PROXY_FILE)) return;
+    let proxy = JSON.parse(fs.readFileSync(PROXY_FILE, 'utf-8'));
+
+    // Auto-renew if expired
+    if (isProxyExpired(proxy)) {
+      proxy = await renewProxy(proxy);
+    }
+
+    if (proxy.server) BROWSER_PROXY = proxy.server;
+    if (proxy.lang) BROWSER_LANG = proxy.lang;
+    if (proxy.timezone) BROWSER_TIMEZONE = proxy.timezone;
+  } catch (e) {
+    console.error(`[proxy] Error loading proxy config: ${e.message}`);
+  }
+}
 
 // --- Fingerprint diversification ---
 // Deterministic per-topic: same topic always gets same fingerprint, different topics differ.
@@ -295,7 +367,7 @@ function findFreePort() {
 function spawnChromium(debugPort) {
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
   const execPath = chromium.executablePath();
-  const child = spawn(execPath, [
+  const args = [
     `--user-data-dir=${PROFILE_DIR}`,
     `--remote-debugging-port=${debugPort}`,
     '--no-first-run',
@@ -305,8 +377,10 @@ function spawnChromium(debugPort) {
     '--disable-renderer-backgrounding',
     `--lang=${BROWSER_LANG}`,
     `--window-size=${FP.windowWidth},${FP.windowHeight}`,
-    'about:blank',
-  ], {
+  ];
+  if (BROWSER_PROXY) args.push(`--proxy-server=${BROWSER_PROXY}`);
+  args.push('about:blank');
+  const child = spawn(execPath, args, {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, TZ: BROWSER_TIMEZONE },
@@ -317,6 +391,9 @@ function spawnChromium(debugPort) {
 
 /** Connect to existing browser or launch a new one */
 async function ensureBrowser(url) {
+  // Load proxy config (auto-renew if expired) before launching browser
+  await loadProxy();
+
   let port;
   let isNewBrowser = false;
   const state = loadState();
