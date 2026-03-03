@@ -3,14 +3,16 @@
  * Proxy Manager — manage per-workspace residential proxy IPs via Qingguo (青果网络) API.
  *
  * Usage:
- *   proxy-manager assign <topic> --city 上海 --isp 电信
+ *   proxy-manager assign <topic> --area 440300 --isp 电信
  *   proxy-manager renew [topic]        # renew all if topic omitted
  *   proxy-manager list
- *   proxy-manager release <topic>
+ *   proxy-manager query [topic]        # query actual in-use IPs from Qingguo API
+ *   proxy-manager resources             # list available areas & ISPs for current key
+ *   proxy-manager test [topic]          # test proxy connectivity (all if omitted)
  *
  * Environment:
- *   QG_AUTH_KEY   — Qingguo API AuthKey (required for assign/renew/release)
- *   QG_AUTH_PWD   — Qingguo API AuthPwd (used for SOCKS5 proxy authentication)
+ *   QG_AUTH_KEY   — Qingguo API AuthKey (required for assign/renew/query)
+ *   QG_AUTH_PWD   — Qingguo API AuthPwd (for SOCKS5 auth fallback)
  *   GROUPS_DIR    — path to groups directory (default: ./groups)
  */
 
@@ -74,14 +76,58 @@ class QinguoClient {
   }
 
   /**
-   * Release (return) an IP back to the pool.
-   * Only available for static IPs. Dynamic IPs auto-expire — /delete is not supported.
-   * Endpoint: GET https://longterm.proxy.qg.net/delete?key=XXX&ip=XXX
+   * Query channel availability.
+   * Endpoint: GET https://longterm.proxy.qg.net/channels?key=XXX
+   * @returns {Promise<{ total: number, idle: number }>}
    */
-  async releaseIP(ip) {
-    // Dynamic IPs (24h rotation) cannot be released via API — they auto-expire.
-    // This method is kept for future static IP support.
-    console.log(`  Note: dynamic IP auto-expires, no release needed`);
+  async queryChannels() {
+    const url = new URL('/channels', this.baseUrl);
+    url.searchParams.set('key', this.authKey);
+    const res = await fetch(url.toString());
+    const json = await res.json();
+    if (json.code !== 'SUCCESS') {
+      throw new Error(`Qingguo channels error: ${json.code}`);
+    }
+    return json.data; // { total, idle }
+  }
+
+  /**
+   * Query available resource areas & ISPs for this key.
+   * Endpoint: GET https://longterm.proxy.qg.net/resources?key=XXX
+   * Each item: { area, area_code, isp, isp_code, available }
+   * Use this to know which area+isp combos are valid for assign.
+   * @returns {Promise<Array>}
+   */
+  async queryResources() {
+    const url = new URL('/resources', this.baseUrl);
+    url.searchParams.set('key', this.authKey);
+    const res = await fetch(url.toString());
+    const json = await res.json();
+    if (json.code !== 'SUCCESS') {
+      throw new Error(`Qingguo resources error: ${json.code}`);
+    }
+    return json.data || [];
+  }
+
+  /**
+   * Query actual in-use IPs from Qingguo.
+   * Endpoint: GET https://longterm.proxy.qg.net/query?key=XXX&task=XXX
+   * When "IP离线自动更换" is enabled, the returned IP may differ from the originally extracted one.
+   * @param {string} [taskId] - specific task_id, or omit for all
+   * @returns {Promise<Array>} array of in-use IP objects
+   */
+  async queryIP(taskId) {
+    const url = new URL('/query', this.baseUrl);
+    url.searchParams.set('key', this.authKey);
+    if (taskId) url.searchParams.set('task', taskId);
+
+    const res = await fetch(url.toString());
+    const json = await res.json();
+
+    if (json.code !== 'SUCCESS') {
+      throw new Error(`Qingguo query error: ${json.code} (request_id: ${json.request_id || 'N/A'})`);
+    }
+    return json.data || [];
   }
 }
 
@@ -105,11 +151,6 @@ function writeProxy(topic, data) {
   const dir = path.join(GROUPS_DIR, topic, BROWSER_DATA_DIR);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(proxyPath(topic), JSON.stringify(data, null, 2));
-}
-
-function deleteProxy(topic) {
-  const p = proxyPath(topic);
-  if (fs.existsSync(p)) fs.unlinkSync(p);
 }
 
 /** Find all topics that have a .proxy file */
@@ -181,23 +222,14 @@ async function cmdRenew(topic) {
 
     console.log(`${t}: renewing (${existing.area}/${existing.isp}) ...`);
 
-    // Release old IP (auto-expires, but log it)
-    try {
-      await client.releaseIP(existing.server);
-    } catch (e) {
-      console.warn(`  Warning: ${e.message}`);
-    }
-
-    // Extract new IP with same area + ISP
+    // Extract new IP with same area + ISP (old IP auto-expires)
     try {
       const result = await client.extractIP({
         area: existing.areaCode || '',
         isp: existing.ispInput || existing.isp,
       });
 
-      const proxyServer = QG_AUTH_PWD
-        ? `socks5://${QG_AUTH_KEY}:${QG_AUTH_PWD}@${result.server}`
-        : `socks5://${result.server}`;
+      const proxyServer = `socks5://${result.server}`;
 
       const proxyData = {
         ...existing,
@@ -220,7 +252,18 @@ async function cmdRenew(topic) {
   }
 }
 
-function cmdList() {
+async function cmdList() {
+  // Show channel availability
+  if (QG_AUTH_KEY) {
+    try {
+      const client = new QinguoClient(QG_AUTH_KEY);
+      const ch = await client.queryChannels();
+      console.log(`Channels: ${ch.idle} idle / ${ch.total} total\n`);
+    } catch (e) {
+      console.warn(`Could not query channels: ${e.message}\n`);
+    }
+  }
+
   const topics = findProxiedTopics();
   if (topics.length === 0) {
     console.log('No proxied workspaces.');
@@ -233,24 +276,149 @@ function cmdList() {
   }
 }
 
-async function cmdRelease(topic) {
-  const existing = readProxy(topic);
-  if (!existing) {
-    console.log(`${topic}: no .proxy file`);
+async function cmdQuery(topic) {
+  if (!QG_AUTH_KEY) {
+    console.error('Error: QG_AUTH_KEY environment variable is required');
+    process.exit(1);
+  }
+
+  const client = new QinguoClient(QG_AUTH_KEY);
+
+  // If topic specified, query its task_id; otherwise query all
+  const topics = topic ? [topic] : findProxiedTopics();
+  const taskIds = [];
+
+  for (const t of topics) {
+    const p = readProxy(t);
+    if (p?.taskId) taskIds.push({ topic: t, taskId: p.taskId });
+  }
+
+  if (taskIds.length === 0 && !topic) {
+    // No local .proxy files — query all in-use IPs from API
+    console.log('Querying all in-use IPs from Qingguo API...\n');
+    const ips = await client.queryIP();
+    if (ips.length === 0) {
+      console.log('No in-use IPs.');
+      return;
+    }
+    for (const ip of ips) {
+      console.log(`  ${ip.proxy_ip.padEnd(18)} ${(ip.area || '?').padEnd(16)} ${(ip.isp || '?').padEnd(6)}  server: ${ip.server}  task: ${ip.task_id}  deadline: ${ip.deadline}`);
+    }
     return;
   }
 
-  if (QG_AUTH_KEY) {
-    const client = new QinguoClient(QG_AUTH_KEY);
+  for (const { topic: t, taskId } of taskIds) {
+    console.log(`${t} (task: ${taskId}):`);
     try {
-      await client.releaseIP(existing.server);
+      const ips = await client.queryIP(taskId);
+      if (ips.length === 0) {
+        console.log('  No in-use IPs for this task.\n');
+        continue;
+      }
+      for (const ip of ips) {
+        const p = readProxy(t);
+        const changed = p?.proxyIp && p.proxyIp !== ip.proxy_ip ? ' ⚠ IP changed by auto-replace!' : '';
+        console.log(`  proxy_ip: ${ip.proxy_ip}  server: ${ip.server}  area: ${ip.area}  isp: ${ip.isp}  deadline: ${ip.deadline}${changed}`);
+      }
     } catch (e) {
-      console.warn(`Warning: ${e.message}`);
+      console.error(`  Error: ${e.message}`);
     }
+    console.log();
+  }
+}
+
+async function cmdTest(topic) {
+  const topics = topic ? [topic] : findProxiedTopics();
+  if (topics.length === 0) {
+    console.log('No proxied workspaces found.');
+    return;
   }
 
-  deleteProxy(topic);
-  console.log(`${topic}: .proxy file removed`);
+  for (const t of topics) {
+    const p = readProxy(t);
+    if (!p?.server) {
+      console.log(`${t}: no proxy configured`);
+      continue;
+    }
+
+    // Parse host:port from socks5://host:port
+    const serverUrl = p.server.replace(/^socks5:\/\//, '');
+    const testUrl = 'http://httpbin.org/ip';
+
+    process.stdout.write(`${t}: testing ${p.proxyIp} (${p.area}/${p.isp}) ... `);
+
+    try {
+      // Try without auth first (IP whitelist), then with auth
+      let result = await testSocks5(serverUrl, testUrl);
+      if (!result && QG_AUTH_KEY && QG_AUTH_PWD) {
+        result = await testSocks5(serverUrl, testUrl, QG_AUTH_KEY, QG_AUTH_PWD);
+        if (result) {
+          console.log(`✓ ${result.origin} (auth required — add this machine to IP whitelist)`);
+          continue;
+        }
+      }
+      if (result) {
+        const match = result.origin === p.proxyIp ? '✓' : '⚠ IP mismatch!';
+        console.log(`${match} ${result.origin}`);
+      } else {
+        console.log('✗ connection failed');
+      }
+    } catch (e) {
+      console.log(`✗ ${e.message}`);
+    }
+  }
+}
+
+/**
+ * Test SOCKS5 proxy by fetching a URL via curl.
+ * Returns parsed JSON or null on failure.
+ */
+async function testSocks5(server, url, user, pass) {
+  const { execSync } = await import('child_process');
+  const args = ['curl', '-s', '--socks5', server, '--connect-timeout', '10'];
+  if (user && pass) args.push('--proxy-user', `${user}:${pass}`);
+  args.push(url);
+  try {
+    const out = execSync(args.join(' '), { timeout: 15000 }).toString();
+    return JSON.parse(out);
+  } catch {
+    return null;
+  }
+}
+
+async function cmdResources() {
+  if (!QG_AUTH_KEY) {
+    console.error('Error: QG_AUTH_KEY environment variable is required');
+    process.exit(1);
+  }
+
+  const client = new QinguoClient(QG_AUTH_KEY);
+  const resources = await client.queryResources();
+
+  if (resources.length === 0) {
+    console.log('No available resources for this key.');
+    return;
+  }
+
+  // Group by province for readability
+  const byProvince = {};
+  for (const r of resources) {
+    // Extract province from area name (e.g. "河北省秦皇岛市" → "河北省")
+    const province = r.area.match(/^(.+?省|.+?市|.+?自治区)/)?.[1] || r.area;
+    if (!byProvince[province]) byProvince[province] = [];
+    byProvince[province].push(r);
+  }
+
+  const available = resources.filter(r => r.available).length;
+  console.log(`Resources: ${available} available / ${resources.length} total\n`);
+
+  for (const [province, items] of Object.entries(byProvince)) {
+    console.log(`${province}:`);
+    for (const r of items) {
+      const status = r.available ? '✓' : '✗';
+      console.log(`  ${status} ${r.area.padEnd(14)} ${String(r.area_code).padEnd(8)} ${r.isp}`);
+    }
+  }
 }
 
 // --- CLI entry ---
@@ -276,15 +444,19 @@ switch (cmd) {
     break;
   }
   case 'list': {
-    cmdList();
+    cmdList().catch(e => { console.error(e.message); process.exit(1); });
     break;
   }
-  case 'release': {
-    if (!args[0]) {
-      console.error('Usage: proxy-manager release <topic>');
-      process.exit(1);
-    }
-    cmdRelease(args[0]).catch(e => { console.error(e.message); process.exit(1); });
+  case 'query': {
+    cmdQuery(args[0]).catch(e => { console.error(e.message); process.exit(1); });
+    break;
+  }
+  case 'test': {
+    cmdTest(args[0]).catch(e => { console.error(e.message); process.exit(1); });
+    break;
+  }
+  case 'resources': {
+    cmdResources().catch(e => { console.error(e.message); process.exit(1); });
     break;
   }
   default:
@@ -293,8 +465,10 @@ switch (cmd) {
 Commands:
   assign <topic> [--area <code>] [--isp <电信|移动|联通>]   Extract IP and assign
   renew [topic]                                            Renew IP (all if omitted)
-  list                                                     List all proxy assignments
-  release <topic>                                          Release IP and remove config
+  list                                                     List assignments + channel status
+  query [topic]                                            Query actual in-use IPs from API
+  test [topic]                                             Test proxy connectivity (all if omitted)
+  resources                                                List available areas & ISPs for key
 
 Environment:
   QG_AUTH_KEY   Qingguo API AuthKey (required)
