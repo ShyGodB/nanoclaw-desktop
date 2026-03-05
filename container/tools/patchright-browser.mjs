@@ -99,23 +99,70 @@ async function renewProxy(proxy) {
   return newProxy;
 }
 
-// Load per-workspace proxy config (overrides env defaults)
-async function loadProxy() {
+/**
+ * Test SOCKS5 proxy connectivity by fetching httpbin.org/ip.
+ * Returns the outbound IP string on success, null on failure.
+ */
+async function testProxy(server) {
+  const { execSync } = await import('child_process');
+  const host = server.replace(/^socks5:\/\//, '');
   try {
-    if (!fs.existsSync(PROXY_FILE)) return;
-    let proxy = JSON.parse(fs.readFileSync(PROXY_FILE, 'utf-8'));
-
-    // Auto-renew if expired
-    if (isProxyExpired(proxy)) {
-      proxy = await renewProxy(proxy);
-    }
-
-    if (proxy.server) BROWSER_PROXY = proxy.server;
-    if (proxy.lang) BROWSER_LANG = proxy.lang;
-    if (proxy.timezone) BROWSER_TIMEZONE = proxy.timezone;
-  } catch (e) {
-    console.error(`[proxy] Error loading proxy config: ${e.message}`);
+    const out = execSync(`curl -s --socks5 ${host} --connect-timeout 10 http://httpbin.org/ip`, { timeout: 15000 }).toString();
+    return JSON.parse(out).origin || null;
+  } catch {
+    return null;
   }
+}
+
+/**
+ * Load per-workspace proxy config (overrides env defaults).
+ * Returns true if proxy is ready (or not configured).
+ * Throws if proxy is configured but unavailable (blocks browser launch).
+ */
+async function loadProxy() {
+  if (!fs.existsSync(PROXY_FILE)) return; // no proxy configured — direct connection OK
+
+  let proxy;
+  try {
+    proxy = JSON.parse(fs.readFileSync(PROXY_FILE, 'utf-8'));
+  } catch (e) {
+    throw new Error(`[PROXY ERROR] Cannot read .proxy config: ${e.message}. Browser launch blocked to protect account identity.`);
+  }
+
+  // Auto-renew if expired
+  if (isProxyExpired(proxy)) {
+    proxy = await renewProxy(proxy);
+  }
+
+  if (!proxy.server) {
+    throw new Error('[PROXY ERROR] .proxy file exists but has no server address. Browser launch blocked to protect account identity.');
+  }
+
+  // Verify proxy is actually reachable before allowing browser to start
+  console.error(`[proxy] Testing connectivity: ${proxy.server} ...`);
+  const actualIp = await testProxy(proxy.server);
+
+  if (!actualIp) {
+    throw new Error(
+      `[PROXY ERROR] Proxy ${proxy.server} is not reachable. ` +
+      `Expected outbound IP: ${proxy.proxyIp} (${proxy.area}/${proxy.isp}). ` +
+      `Deadline: ${proxy.deadline}. ` +
+      `Browser launch blocked to protect account identity. ` +
+      `Please run: patchright-browser check-ip, or ask the user to renew the proxy.`
+    );
+  }
+
+  if (proxy.proxyIp && actualIp !== proxy.proxyIp) {
+    console.error(`[proxy] WARNING: Outbound IP ${actualIp} differs from expected ${proxy.proxyIp} — proxy may have been auto-replaced`);
+    // Update .proxy with actual IP (don't block — IP is still proxied)
+    proxy.proxyIp = actualIp;
+    fs.writeFileSync(PROXY_FILE, JSON.stringify(proxy, null, 2));
+  }
+
+  console.error(`[proxy] OK: ${actualIp} (${proxy.area}/${proxy.isp})`);
+  BROWSER_PROXY = proxy.server;
+  if (proxy.lang) BROWSER_LANG = proxy.lang;
+  if (proxy.timezone) BROWSER_TIMEZONE = proxy.timezone;
 }
 
 // --- Fingerprint diversification ---
@@ -866,6 +913,38 @@ try {
       break;
     }
 
+    case 'check-ip': {
+      await loadProxy();
+      const proxyFile = fs.existsSync(PROXY_FILE) ? JSON.parse(fs.readFileSync(PROXY_FILE, 'utf-8')) : null;
+
+      // Check actual outbound IP via curl
+      let actualIp = null;
+      try {
+        const { execSync } = await import('child_process');
+        if (BROWSER_PROXY) {
+          const server = BROWSER_PROXY.replace(/^socks5:\/\//, '');
+          const out = execSync(`curl -s --socks5 ${server} --connect-timeout 10 http://httpbin.org/ip`, { timeout: 15000 }).toString();
+          actualIp = JSON.parse(out).origin;
+        } else {
+          const out = execSync('curl -s --connect-timeout 10 http://httpbin.org/ip', { timeout: 15000 }).toString();
+          actualIp = JSON.parse(out).origin;
+        }
+      } catch {}
+
+      if (!proxyFile) {
+        console.log(`Proxy: not configured (direct connection)`);
+        console.log(`Outbound IP: ${actualIp || 'unknown'}`);
+      } else {
+        const match = actualIp === proxyFile.proxyIp ? '✓ match' : '⚠ mismatch';
+        console.log(`Proxy: ${proxyFile.server}`);
+        console.log(`Expected IP: ${proxyFile.proxyIp}`);
+        console.log(`Actual IP: ${actualIp || 'unknown'} (${match})`);
+        console.log(`Location: ${proxyFile.area} / ${proxyFile.isp}`);
+        console.log(`Deadline: ${proxyFile.deadline}`);
+      }
+      break;
+    }
+
     case 'status': {
       const state = loadState();
       if (state?.port && await isCdpAlive(state.port)) {
@@ -885,7 +964,7 @@ try {
 
     default:
       console.error(`Unknown command: ${command}`);
-      console.error('Commands: open, snapshot, screenshot, html, text, click, fill, type, select, hover, press, scroll, back, forward, reload, wait, eval, close, status');
+      console.error('Commands: open, snapshot, screenshot, html, text, click, fill, type, select, hover, press, scroll, back, forward, reload, wait, eval, close, check-ip, status');
       process.exit(1);
   }
   // Disconnect from CDP WebSocket so Node can exit

@@ -18,6 +18,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import childProcess from 'child_process';
 
 const GROUPS_DIR = process.env.GROUPS_DIR || path.join(process.cwd(), 'groups');
 const QG_AUTH_KEY = process.env.QG_AUTH_KEY || '';
@@ -206,7 +207,31 @@ function topicLabel(topic) {
 function writeProxy(topic, data) {
   const dir = path.join(GROUPS_DIR, topic, BROWSER_DATA_DIR);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(proxyPath(topic), JSON.stringify(data, null, 2));
+  const p = proxyPath(topic);
+  fs.writeFileSync(p, JSON.stringify(data, null, 2));
+
+  // Sync to Lume VM to bypass VirtioFS cache
+  syncProxyToVM(topic, p);
+}
+
+/** SCP .proxy file to Lume VM workspace if VM is configured */
+function syncProxyToVM(topic, localPath) {
+  const vmIp = process.env.LUME_VM_IP;
+  const vmUser = process.env.LUME_VM_USER || 'lume';
+  if (!vmIp) return;
+
+  const safeName = topic.replace(/[^a-zA-Z0-9-]/g, '-');
+  const vmDir = `/Users/${vmUser}/workspace/${safeName}/group/${BROWSER_DATA_DIR}`;
+  const vmPath = `${vmDir}/${PROXY_FILENAME}`;
+
+  try {
+    const { execSync } = childProcess;
+    execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${vmUser}@${vmIp} "mkdir -p ${vmDir}"`, { timeout: 10000 });
+    execSync(`scp -o ConnectTimeout=5 -o StrictHostKeyChecking=no "${localPath}" ${vmUser}@${vmIp}:"${vmPath}"`, { timeout: 10000 });
+    console.log(`  Synced to VM: ${vmPath}`);
+  } catch (e) {
+    console.warn(`  Warning: could not sync to VM (${e.message})`);
+  }
 }
 
 /** Find all topics that have a .proxy file */
